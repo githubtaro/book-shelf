@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>BookShelf - 蔵書管理</title>
+<link rel="manifest" href="manifest.json">
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&display=swap');
+  * { font-family: 'Noto Sans JP', sans-serif; -webkit-tap-highlight-color: transparent; }
+  body { margin: 0; background: #fafaf9; overscroll-behavior: none; }
+  .safe-pb { padding-bottom: env(safe-area-inset-bottom, 0px); }
+  #scanner-region video { border-radius: 12px; }
+  #scanner-region { position: relative; }
+  .fade-in { animation: fadeIn 0.2s ease; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<script>
+// ─── IndexedDB wrapper ───
+const IDB = {
+  db: null,
+  async open() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open("BookShelfDB", 2);
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains("books")) {
+          const store = db.createObjectStore("books", { keyPath: "id" });
+          store.createIndex("isbn", "isbn", { unique: false });
+          store.createIndex("title", "title", { unique: false });
+          store.createIndex("locationId", "locationId", { unique: false });
+        }
+        if (!db.objectStoreNames.contains("locations")) db.createObjectStore("locations", { keyPath: "id" });
+        if (!db.objectStoreNames.contains("categories")) db.createObjectStore("categories", { keyPath: "id" });
+      };
+      req.onsuccess = (e) => { IDB.db = e.target.result; resolve(); };
+      req.onerror = () => reject(req.error);
+    });
+  },
+  async getAll(store) {
+    return new Promise((resolve, reject) => {
+      const tx = IDB.db.transaction(store, "readonly");
+      const req = tx.objectStore(store).getAll();
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  },
+  async put(store, data) {
+    return new Promise((resolve, reject) => {
+      const tx = IDB.db.transaction(store, "readwrite");
+      tx.objectStore(store).put(data);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  },
+  async del(store, id) {
+    return new Promise((resolve, reject) => {
+      const tx = IDB.db.transaction(store, "readwrite");
+      tx.objectStore(store).delete(id);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  },
+  async clear(store) {
+    return new Promise((resolve, reject) => {
+      const tx = IDB.db.transaction(store, "readwrite");
+      tx.objectStore(store).clear();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+};
+
+// ─── API lookup ───
+async function lookupISBN(isbn) {
+  const cleaned = isbn.replace(/[-\s]/g, "");
+  let result = null;
+  try {
+    const res = await fetch("https://www.googleapis.com/books/v1/volumes?q=isbn:" + cleaned);
+    const data = await res.json();
+    if (data.totalItems > 0) {
+      const v = data.items[0].volumeInfo;
+      result = {
+        isbn: cleaned, title: v.title || "", author: (v.authors || []).join(", "),
+        publisher: v.publisher || "", publishedDate: v.publishedDate || "",
+        description: v.description || "", coverUrl: (v.imageLinks?.thumbnail || "").replace("http:", "https:"),
+        pageCount: v.pageCount || null, category: (v.categories || [])[0] || "",
+        listPrice: null, source: "google"
+      };
+    }
+  } catch(e) { console.error("Google Books error:", e); }
+  if (!result || !result.title) {
+    try {
+      const res = await fetch("https://api.openbd.jp/v1/get?isbn=" + cleaned);
+      const data = await res.json();
+      if (data && data[0]) {
+        const s = data[0].summary;
+        let price = null;
+        try {
+          const onix = data[0].onix;
+          const supplies = onix?.ProductSupply;
+          if (supplies) {
+            const arr = Array.isArray(supplies) ? supplies : [supplies];
+            for (const sup of arr) {
+              const p = sup?.SupplyDetail?.Price;
+              if (p) { const pa = Array.isArray(p) ? p : [p]; for (const pi of pa) { if (pi?.PriceAmount) { price = parseInt(pi.PriceAmount); break; } } }
+              if (price) break;
+            }
+          }
+        } catch(e) {}
+        result = {
+          isbn: cleaned, title: s?.title || result?.title || "",
+          author: s?.author || result?.author || "", publisher: s?.publisher?.name || s?.publisher || result?.publisher || "",
+          publishedDate: s?.pubdate || result?.publishedDate || "",
+          description: data[0].onix?.CollateralDetail?.TextContent?.[0]?.Text || result?.description || "",
+          coverUrl: s?.cover || result?.coverUrl || "", pageCount: result?.pageCount || null,
+          category: result?.category || "", listPrice: price || result?.listPrice || null,
+          source: result?.source === "google" ? "google+openbd" : "openbd"
+        };
+      }
+    } catch(e) { console.error("openBD error:", e); }
+  }
+  return result;
+}
+
+// ─── Default data ───
+const DEFAULT_LOCATIONS = [
+  { id: "loc_1", name: "リビング", sortOrder: 1 },
+  { id: "loc_2", name: "書斎", sortOrder: 2 },
+  { id: "loc_3", name: "寝室", sortOrder: 3 },
+  { id: "loc_4", name: "子供部屋", sortOrder: 4 },
+  { id: "loc_5", name: "その他", sortOrder: 99 },
+];
+const DEFAULT_CATEGORIES = [
+  { id: "cat_1", name: "漫画" }, { id: "cat_2", name: "小説・文学" },
+  { id: "cat_3", name: "ビジネス" }, { id: "cat_4", name: "技術書・IT" },
+  { id: "cat_5", name: "趣味・実用" }, { id: "cat_6", name: "絵本・児童書" },
+  { id: "cat_7", name: "雑誌" }, { id: "cat_8", name: "学習・参考書" },
+  { id: "cat_9", name: "その他" },
+];
+
+// ─── App State ───
+let state = { page: "home", books: [], locations: [], categories: [], pageData: null, scannerActive: false };
+let html5QrCode = null;
+
+function setState(updates) { Object.assign(state, updates); render(); }
+function navigate(page, data) { stopScanner(); setState({ page, pageData: data || null }); window.scrollTo(0, 0); }
+
+// ─── Data operations ───
+async function loadData() {
+  await IDB.open();
+  let [books, locations, categories] = await Promise.all([IDB.getAll("books"), IDB.getAll("locations"), IDB.getAll("categories")]);
+  books = books.filter(b => !b.deletedAt).sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+  if (locations.length === 0) { for (const l of DEFAULT_LOCATIONS) await IDB.put("locations", l); locations = DEFAULT_LOCATIONS; }
+  if (categories.length === 0) { for (const c of DEFAULT_CATEGORIES) await IDB.put("categories", c); categories = DEFAULT_CATEGORIES; }
+  locations.sort((a, b) => a.sortOrder - b.sortOrder);
+  setState({ books, locations, categories });
+}
+async function refreshBooks() {
+  const books = (await IDB.getAll("books")).filter(b => !b.deletedAt).sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+  setState({ books });
+}
+async function refreshLocations() {
+  const locations = (await IDB.getAll("locations")).sort((a, b) => a.sortOrder - b.sortOrder);
+  setState({ locations });
+}
+
+// ─── Scanner ───
+function stopScanner() {
+  if (html5QrCode) {
+    try { html5QrCode.stop().catch(() => {}); } catch(e) {}
+    html5QrCode = null;
+  }
+  state.scannerActive = false;
+}
+
+function startScanner() {
+  stopScanner();
+  const el = document.getElementById("scanner-region");
+  if (!el) return;
+  html5QrCode = new Html5Qrcode("scanner-region");
+  html5QrCode.start(
+    { facingMode: "environment" },
+    { fps: 10, qrbox: { width: 250, height: 100 }, aspectRatio: 1.5 },
+    (decoded) => {
+      const cleaned = decoded.replace(/[-\s]/g, "");
+      if (/^\d{10,13}$/.test(cleaned)) {
+        stopScanner();
+        document.getElementById("isbn-input").value = cleaned;
+        handleISBNLookup(cleaned);
+      }
+    },
+    () => {}
+  ).then(() => { state.scannerActive = true; }).catch(err => {
+    console.error("Scanner error:", err);
+    const el = document.getElementById("scanner-error");
+    if (el) el.textContent = "カメラを起動できません。ブラウザの設定でカメラを許可してください。";
+  });
+}
+
+async function handleISBNLookup(isbn) {
+  const cleaned = isbn.replace(/[-\s]/g, "");
+  if (cleaned.length !== 10 && cleaned.length !== 13) {
+    showError("ISBNは10桁または13桁で入力してください"); return;
+  }
+  showLoading(true);
+  const result = await lookupISBN(cleaned);
+  showLoading(false);
+  if (result && result.title) { navigate("confirm", result); }
+  else { showError("書籍情報が見つかりませんでした"); }
+}
+
+function showError(msg) { const el = document.getElementById("scan-error"); if (el) { el.textContent = msg; el.classList.remove("hidden"); } }
+function showLoading(on) { const el = document.getElementById("scan-loading"); if (el) el.classList.toggle("hidden", !on); }
+
+// ─── Render helpers ───
+function esc(s) { if (!s) return ""; const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+function coverHTML(url, title, size = "md") {
+  const sizes = { sm: "w-10 h-14", md: "w-16 h-22", lg: "w-28 h-40" };
+  const tsizes = { sm: "text-[8px]", md: "text-[10px]", lg: "text-xs" };
+  const placeholder = `<div class="${sizes[size]} bg-stone-200 rounded shadow-sm flex items-center justify-center p-1"><span class="${tsizes[size]} text-stone-400 text-center leading-tight">${esc((title || "No Image").slice(0, 12))}</span></div>`;
+  if (!url) return placeholder;
+  return `<img src="${esc(url)}" alt="${esc(title)}" class="${sizes[size]} object-cover rounded shadow-sm bg-stone-100" onerror="this.outerHTML='${placeholder.replace(/'/g, "\\'")}'">`;
+}
+function locName(id) { const l = state.locations.find(l => l.id === id); return l ? l.name : ""; }
+function catName(id) { const c = state.categories.find(c => c.id === id); return c ? c.name : ""; }
+
+// ─── Page renderers ───
+function renderHome() {
+  const dupeCount = Object.values(state.books.reduce((a, b) => { if (b.isbn) a[b.isbn] = (a[b.isbn] || 0) + 1; return a; }, {})).filter(c => c > 1).length;
+  const totalQty = state.books.reduce((s, b) => s + (b.quantity || 1), 0);
+  const recent = state.books.slice(0, 5);
+  return `
+    <div class="bg-gradient-to-br from-amber-800 via-amber-900 to-stone-900 text-white px-5 pt-8 pb-10">
+      <div class="flex items-center gap-2 mb-1"><svg class="w-6 h-6 text-amber-300" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+      <h1 class="text-xl font-bold tracking-tight">BookShelf</h1></div>
+      <p class="text-amber-200/70 text-xs">家族の蔵書管理アプリ</p>
+      <div class="mt-6 grid grid-cols-3 gap-3">
+        <div class="bg-white/10 rounded-xl px-3 py-3 text-center backdrop-blur"><div class="text-2xl font-bold">${state.books.length}<span class="text-sm ml-0.5 font-normal text-amber-200/60">冊</span></div><div class="text-[10px] text-amber-200/60 mt-0.5">総蔵書数</div></div>
+        <div class="bg-white/10 rounded-xl px-3 py-3 text-center backdrop-blur"><div class="text-2xl font-bold">${state.locations.length}<span class="text-sm ml-0.5 font-normal text-amber-200/60">箇所</span></div><div class="text-[10px] text-amber-200/60 mt-0.5">保管場所</div></div>
+        <div class="bg-white/10 rounded-xl px-3 py-3 text-center backdrop-blur"><div class="text-2xl font-bold">${totalQty}<span class="text-sm ml-0.5 font-normal text-amber-200/60">冊</span></div><div class="text-[10px] text-amber-200/60 mt-0.5">総冊数</div></div>
+      </div>
+    </div>
+    <div class="px-4 -mt-4 space-y-3">
+      <button onclick="navigate('scan')" class="w-full bg-amber-700 hover:bg-amber-800 text-white rounded-xl px-4 py-4 flex items-center gap-3 shadow-lg transition-colors">
+        <div class="bg-amber-600 rounded-lg p-2"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg></div>
+        <div class="text-left"><div class="font-bold text-sm">本を登録する</div><div class="text-amber-200/70 text-[11px]">バーコードスキャンまたはISBN入力</div></div>
+      </button>
+      <div class="grid grid-cols-2 gap-3">
+        <button onclick="navigate('books')" class="bg-white rounded-xl px-4 py-4 text-left shadow-sm border border-stone-100 hover:border-amber-200 transition-colors">
+          <svg class="w-5 h-5 text-amber-700 mb-2" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+          <div class="text-sm font-bold text-stone-800">蔵書一覧</div><div class="text-[11px] text-stone-400">${state.books.length}冊登録済み</div></button>
+        <button onclick="navigate('duplicates')" class="bg-white rounded-xl px-4 py-4 text-left shadow-sm border border-stone-100 hover:border-amber-200 transition-colors">
+          <svg class="w-5 h-5 mb-2 ${dupeCount > 0 ? 'text-orange-500' : 'text-stone-300'}" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+          <div class="text-sm font-bold text-stone-800">重複チェック</div><div class="text-[11px] text-stone-400">${dupeCount > 0 ? dupeCount + '件の重複ISBN' : '重複なし'}</div></button>
+      </div>
+      <button onclick="navigate('settings')" class="w-full bg-white rounded-xl px-4 py-3 flex items-center gap-3 shadow-sm border border-stone-100 text-left hover:border-amber-200 transition-colors">
+        <svg class="w-4 h-4 text-stone-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        <span class="text-sm text-stone-600">データのバックアップ / 復元</span></button>
+      ${recent.length > 0 ? `<div class="pt-2"><h2 class="text-xs font-bold text-stone-400 uppercase tracking-wider mb-2 px-1">最近登録した本</h2><div class="space-y-2">
+        ${recent.map(b => `<button onclick="navigate('detail', state.books.find(x=>x.id==='${b.id}'))" class="w-full bg-white rounded-xl px-3 py-2.5 flex items-center gap-3 shadow-sm border border-stone-100 text-left hover:border-amber-200 transition-colors">
+          ${coverHTML(b.coverUrl, b.title, "sm")}
+          <div class="flex-1 min-w-0"><div class="text-sm font-medium text-stone-800 truncate">${esc(b.title)}</div><div class="text-[11px] text-stone-400 truncate">${esc(b.author || "")}</div></div></button>`).join("")}
+      </div></div>` : ""}
+    </div><div class="h-8"></div>`;
+}
+
+function renderScan() {
+  return `
+    <header class="sticky top-0 z-40 bg-white/90 backdrop-blur border-b border-stone-200 px-4 py-3"><h1 class="text-base font-bold text-stone-800">本を登録</h1></header>
+    <div class="px-4 py-6 space-y-4 fade-in">
+      <div class="bg-white rounded-2xl p-4 shadow-sm border border-stone-100">
+        <p class="text-xs text-stone-500 mb-3">カメラでバーコードをスキャンするか、ISBNを手入力してください</p>
+        <div id="scanner-region" class="mb-3 rounded-xl overflow-hidden"></div>
+        <div id="scanner-error" class="text-xs text-red-600 mb-2"></div>
+        <button onclick="state.scannerActive ? stopScanner() : startScanner(); render();"
+          class="w-full border border-amber-200 text-amber-700 rounded-lg py-2 text-sm font-medium mb-3 hover:bg-amber-50 transition-colors"
+          id="scanner-toggle">${state.scannerActive ? "カメラを停止" : "カメラを起動してスキャン"}</button>
+        <div class="flex gap-2">
+          <input id="isbn-input" type="text" inputmode="numeric" placeholder="978-4-XXXX-XXXX-X"
+            class="flex-1 border border-stone-200 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500/30"
+            onkeydown="if(event.key==='Enter')handleISBNLookup(this.value)">
+          <button onclick="handleISBNLookup(document.getElementById('isbn-input').value)"
+            class="bg-amber-700 hover:bg-amber-800 text-white px-4 rounded-lg text-sm font-medium transition-colors whitespace-nowrap">検索</button>
+        </div>
+        <div id="scan-error" class="hidden mt-2 text-xs text-red-600 bg-red-50 rounded-lg px-3 py-2"></div>
+        <div id="scan-loading" class="hidden mt-2 text-xs text-amber-700 bg-amber-50 rounded-lg px-3 py-2 text-center">検索中...</div>
+      </div>
+      <div class="bg-amber-50 rounded-2xl p-4 border border-amber-100">
+        <h3 class="text-xs font-bold text-amber-800 mb-2">ISBN の見つけ方</h3>
+        <ul class="text-[11px] text-amber-700 space-y-1">
+          <li>・本の裏表紙のバーコード下にある13桁の数字</li>
+          <li>・「978」または「979」で始まります</li>
+          <li>・古い本は10桁の場合もあります</li>
+        </ul>
+      </div>
+      <button onclick="navigate('confirm', {isbn:'',title:'',author:'',publisher:'',publishedDate:'',description:'',coverUrl:'',pageCount:null,category:'',listPrice:null,source:'manual'})"
+        class="w-full bg-white border border-stone-200 rounded-xl px-4 py-3.5 text-sm text-stone-600 hover:border-amber-300 transition-colors text-center">バーコードなしの本を手動登録</button>
+    </div>`;
+}
+
+function renderConfirm() {
+  const d = state.pageData || {};
+  const dupes = d.isbn ? state.books.filter(b => b.isbn === d.isbn) : [];
+  return `
+    <header class="sticky top-0 z-40 bg-white/90 backdrop-blur border-b border-stone-200 px-4 py-3 flex items-center gap-3">
+      <button onclick="navigate('scan')" class="text-stone-500 -ml-1"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg></button>
+      <h1 class="text-base font-bold text-stone-800">登録内容の確認</h1></header>
+    <div class="px-4 py-4 space-y-4 fade-in">
+      ${dupes.length > 0 ? `<div class="bg-orange-50 border border-orange-200 rounded-xl px-4 py-3 text-xs text-orange-700"><b>同じISBNの本が${dupes.length}冊登録済みです。</b></div>` : ""}
+      <div class="flex justify-center">${coverHTML(d.coverUrl, d.title, "lg")}</div>
+      <div class="bg-white rounded-2xl p-4 shadow-sm border border-stone-100 space-y-3" id="confirm-form">
+        ${["title:タイトル *","author:著者","publisher:出版社","publishedDate:出版日","isbn:ISBN","coverUrl:表紙画像URL"].map(f => {
+          const [k, label] = f.split(":");
+          return `<div><label class="text-[11px] font-medium text-stone-500 mb-1 block">${label}</label><input type="text" data-field="${k}" value="${esc(d[k] || "")}" class="w-full border border-stone-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-amber-500"></div>`;
+        }).join("")}
+        <div class="grid grid-cols-2 gap-3">
+          <div><label class="text-[11px] font-medium text-stone-500 mb-1 block">保管場所</label>
+            <select data-field="locationId" class="w-full border border-stone-200 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:border-amber-500">
+              <option value="">未設定</option>${state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("")}</select></div>
+          <div><label class="text-[11px] font-medium text-stone-500 mb-1 block">冊数</label>
+            <input type="number" data-field="quantity" min="1" value="1" class="w-full border border-stone-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-amber-500"></div>
+        </div>
+        <div><label class="text-[11px] font-medium text-stone-500 mb-1 block">カテゴリ</label>
+          <select data-field="categoryId" class="w-full border border-stone-200 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:border-amber-500">
+            <option value="">未設定</option>${state.categories.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join("")}</select></div>
+        <div><label class="text-[11px] font-medium text-stone-500 mb-1 block">メモ</label>
+          <textarea data-field="memo" rows="2" class="w-full border border-stone-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-amber-500 resize-none"></textarea></div>
+      </div>
+      <button onclick="saveBook()" class="w-full bg-amber-700 hover:bg-amber-800 text-white rounded-xl py-3.5 font-bold text-sm shadow-lg transition-colors">この内容で登録する</button>
+      <div class="h-4"></div>
+    </div>`;
+}
+
+async function saveBook() {
+  const form = document.getElementById("confirm-form");
+  const get = (f) => form.querySelector(`[data-field="${f}"]`)?.value || "";
+  const title = get("title").trim();
+  if (!title) { alert("タイトルを入力してください"); return; }
+  const d = state.pageData || {};
+  const id = "book_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
+  const book = {
+    id, isbn: get("isbn") || d.isbn || null, title,
+    author: get("author").trim() || null, publisher: get("publisher").trim() || null,
+    publishedDate: get("publishedDate") || null, description: d.description || null,
+    coverUrl: get("coverUrl") || d.coverUrl || null,
+    pageCount: d.pageCount || null, listPrice: d.listPrice || null,
+    quantity: parseInt(get("quantity")) || 1, locationId: get("locationId") || null,
+    categoryId: get("categoryId") || null, apiSource: d.source || "manual",
+    memo: get("memo").trim() || null, createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(), deletedAt: null,
+  };
+  await IDB.put("books", book);
+  await refreshBooks();
+  navigate("books");
+}
+
+function renderBooks() {
+  return `
+    <header class="sticky top-0 z-40 bg-white/90 backdrop-blur border-b border-stone-200 px-4 py-3 flex items-center">
+      <h1 class="flex-1 text-base font-bold text-stone-800">蔵書一覧（${state.books.length}冊）</h1>
+      <button onclick="navigate('scan')" class="text-amber-700"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button></header>
+    <div class="px-4 py-3 space-y-2 bg-white border-b border-stone-100">
+      <div class="relative">
+        <svg class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-stone-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input id="book-search" type="text" placeholder="タイトル・著者・ISBNで検索" oninput="filterBooks()"
+          class="w-full pl-9 pr-3 py-2 text-sm border border-stone-200 rounded-lg focus:outline-none focus:border-amber-500"></div>
+      <div class="flex gap-2">
+        <select id="loc-filter" onchange="filterBooks()" class="flex-1 text-xs border border-stone-200 rounded-lg px-2 py-1.5 bg-white text-stone-600">
+          <option value="">全ての場所</option>${state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("")}</select>
+        <select id="cat-filter" onchange="filterBooks()" class="flex-1 text-xs border border-stone-200 rounded-lg px-2 py-1.5 bg-white text-stone-600">
+          <option value="">全てのカテゴリ</option>${state.categories.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join("")}</select>
+      </div>
+    </div>
+    <div class="px-4 py-3 space-y-2" id="books-list">${renderBookItems(state.books)}</div><div class="h-4"></div>`;
+}
+
+function renderBookItems(books) {
+  if (books.length === 0) return `<div class="text-center py-16"><p class="text-sm text-stone-400">${state.books.length === 0 ? 'まだ本が登録されていません' : '該当する本が見つかりません'}</p></div>`;
+  return books.map(b => {
+    const loc = locName(b.locationId);
+    const dupeCount = state.books.filter(x => x.isbn && x.isbn === b.isbn).length;
+    return `<button onclick="navigate('detail', state.books.find(x=>x.id==='${b.id}'))" class="w-full bg-white rounded-xl px-3 py-2.5 flex items-center gap-3 shadow-sm border border-stone-100 text-left hover:border-amber-200 transition-colors">
+      ${coverHTML(b.coverUrl, b.title, "sm")}
+      <div class="flex-1 min-w-0">
+        <div class="text-sm font-medium text-stone-800 truncate">${esc(b.title)}</div>
+        <div class="text-[11px] text-stone-400 truncate">${esc(b.author || "著者不明")}</div>
+        <div class="flex items-center gap-2 mt-0.5">
+          ${loc ? `<span class="text-[10px] text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded">📍${esc(loc)}</span>` : ""}
+          ${(b.quantity || 1) > 1 ? `<span class="text-[10px] text-blue-700 bg-blue-50 px-1.5 py-0.5 rounded">×${b.quantity}冊</span>` : ""}
+          ${dupeCount > 1 ? `<span class="text-[10px] text-orange-600 bg-orange-50 px-1.5 py-0.5 rounded">重複あり</span>` : ""}
+        </div></div></button>`;
+  }).join("");
+}
+
+function filterBooks() {
+  const q = (document.getElementById("book-search")?.value || "").toLowerCase();
+  const locF = document.getElementById("loc-filter")?.value || "";
+  const catF = document.getElementById("cat-filter")?.value || "";
+  const filtered = state.books.filter(b => {
+    const matchQ = !q || [b.title, b.author, b.isbn, b.publisher].some(f => f && f.toLowerCase().includes(q));
+    return matchQ && (!locF || b.locationId === locF) && (!catF || b.categoryId === catF);
+  });
+  document.getElementById("books-list").innerHTML = renderBookItems(filtered);
+}
+
+function renderDetail() {
+  const b = state.pageData;
+  if (!b) return `<p class="p-4">データがありません</p>`;
+  const loc = locName(b.locationId); const cat = catName(b.categoryId);
+  return `
+    <header class="sticky top-0 z-40 bg-white/90 backdrop-blur border-b border-stone-200 px-4 py-3 flex items-center gap-3">
+      <button onclick="navigate('books')" class="text-stone-500 -ml-1"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg></button>
+      <h1 class="flex-1 text-base font-bold text-stone-800">書籍詳細</h1>
+      <button onclick="navigate('edit', state.pageData)" class="text-amber-700 mr-2"><svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg></button>
+      <button onclick="deleteBook('${b.id}')" class="text-red-400 hover:text-red-600"><svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button></header>
+    <div class="px-4 py-6 space-y-4 fade-in">
+      <div class="flex gap-4">${coverHTML(b.coverUrl, b.title, "lg")}
+        <div class="flex-1 min-w-0">
+          <h2 class="text-lg font-bold text-stone-800 leading-snug">${esc(b.title)}</h2>
+          <p class="text-sm text-stone-500 mt-1">${esc(b.author || "著者不明")}</p>
+          <p class="text-xs text-stone-400 mt-1">${esc(b.publisher || "")}${b.publishedDate ? " / " + esc(b.publishedDate) : ""}</p>
+          ${b.isbn ? `<p class="text-xs text-stone-400 mt-1 font-mono">ISBN: ${esc(b.isbn)}</p>` : ""}
+        </div></div>
+      <div class="bg-white rounded-2xl p-4 shadow-sm border border-stone-100">
+        <div class="grid grid-cols-2 gap-y-3 gap-x-4 text-sm">
+          ${[["保管場所", loc || "未設定"], ["冊数", (b.quantity || 1) + "冊"], ["カテゴリ", cat || "未設定"], ["ページ数", b.pageCount ? b.pageCount + "p" : "-"],
+            ["定価", b.listPrice ? "¥" + b.listPrice.toLocaleString() : "-"], ["情報取得元", b.apiSource || "-"]].map(([l, v]) =>
+            `<div><div class="text-[10px] text-stone-400">${l}</div><div class="text-stone-700 font-medium">${esc(v)}</div></div>`).join("")}
+        </div></div>
+      ${b.description ? `<div class="bg-white rounded-2xl p-4 shadow-sm border border-stone-100"><h3 class="text-xs font-bold text-stone-500 mb-2">説明</h3><p class="text-xs text-stone-600 leading-relaxed">${esc((b.description || "").slice(0, 400))}</p></div>` : ""}
+      ${b.memo ? `<div class="bg-amber-50 rounded-2xl p-4 border border-amber-100"><h3 class="text-xs font-bold text-amber-700 mb-1">メモ</h3><p class="text-xs text-amber-800">${esc(b.memo)}</p></div>` : ""}
+      <p class="text-[10px] text-stone-300 text-center">登録日: ${new Date(b.createdAt).toLocaleDateString("ja-JP")}</p>
+    </div>`;
+}
+
+async function deleteBook(id) {
+  if (!confirm("この本を削除しますか？")) return;
+  const book = state.books.find(b => b.id === id);
+  if (book) { await IDB.put("books", { ...book, deletedAt: new Date().toISOString() }); await refreshBooks(); }
+  navigate("books");
+}
+
+function renderEdit() {
+  const b = state.pageData;
+  if (!b) return "";
+  return `
+    <header class="sticky top-0 z-40 bg-white/90 backdrop-blur border-b border-stone-200 px-4 py-3 flex items-center gap-3">
+      <button onclick="navigate('detail', state.pageData)" class="text-stone-500 -ml-1"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg></button>
+      <h1 class="text-base font-bold text-stone-800">書籍編集</h1></header>
+    <div class="px-4 py-4 space-y-4 fade-in">
+      <div class="bg-white rounded-2xl p-4 shadow-sm border border-stone-100 space-y-3" id="edit-form">
+        ${["title:タイトル *","author:著者","publisher:出版社","isbn:ISBN","coverUrl:表紙画像URL"].map(f => {
+          const [k, label] = f.split(":");
+          return `<div><label class="text-[11px] font-medium text-stone-500 mb-1 block">${label}</label><input type="text" data-field="${k}" value="${esc(b[k] || "")}" class="w-full border border-stone-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-amber-500"></div>`;
+        }).join("")}
+        <div class="grid grid-cols-2 gap-3">
+          <div><label class="text-[11px] font-medium text-stone-500 mb-1 block">保管場所</label>
+            <select data-field="locationId" class="w-full border border-stone-200 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:border-amber-500">
+              <option value="">未設定</option>${state.locations.map(l => `<option value="${l.id}" ${b.locationId === l.id ? "selected" : ""}>${esc(l.name)}</option>`).join("")}</select></div>
+          <div><label class="text-[11px] font-medium text-stone-500 mb-1 block">冊数</label>
+            <input type="number" data-field="quantity" min="1" value="${b.quantity || 1}" class="w-full border border-stone-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-amber-500"></div>
+        </div>
+        <div><label class="text-[11px] font-medium text-stone-500 mb-1 block">カテゴリ</label>
+          <select data-field="categoryId" class="w-full border border-stone-200 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:border-amber-500">
+            <option value="">未設定</option>${state.categories.map(c => `<option value="${c.id}" ${b.categoryId === c.id ? "selected" : ""}>${esc(c.name)}</option>`).join("")}</select></div>
+        <div><label class="text-[11px] font-medium text-stone-500 mb-1 block">メモ</label>
+          <textarea data-field="memo" rows="2" class="w-full border border-stone-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-amber-500 resize-none">${esc(b.memo || "")}</textarea></div>
+      </div>
+      <button onclick="updateBook('${b.id}')" class="w-full bg-amber-700 hover:bg-amber-800 text-white rounded-xl py-3.5 font-bold text-sm shadow-lg transition-colors">変更を保存する</button>
+    </div>`;
+}
+
+async function updateBook(id) {
+  const form = document.getElementById("edit-form");
+  const get = (f) => form.querySelector(`[data-field="${f}"]`)?.value || "";
+  const title = get("title").trim();
+  if (!title) { alert("タイトルを入力してください"); return; }
+  const book = state.books.find(b => b.id === id);
+  const updated = { ...book, title, author: get("author").trim() || null, publisher: get("publisher").trim() || null,
+    isbn: get("isbn") || null, coverUrl: get("coverUrl") || null, locationId: get("locationId") || null,
+    categoryId: get("categoryId") || null, quantity: parseInt(get("quantity")) || 1,
+    memo: get("memo").trim() || null, updatedAt: new Date().toISOString() };
+  await IDB.put("books", updated); await refreshBooks();
+  navigate("detail", updated);
+}
+
+function renderLocations() {
+  return `
+    <header class="sticky top-0 z-40 bg-white/90 backdrop-blur border-b border-stone-200 px-4 py-3"><h1 class="text-base font-bold text-stone-800">保管場所管理</h1></header>
+    <div class="px-4 py-4 space-y-4 fade-in">
+      <div class="bg-white rounded-2xl p-4 shadow-sm border border-stone-100">
+        <div class="flex gap-2">
+          <input id="new-loc" type="text" placeholder="新しい場所名（例：2階廊下）" onkeydown="if(event.key==='Enter')addLocation()"
+            class="flex-1 border border-stone-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-amber-500">
+          <button onclick="addLocation()" class="bg-amber-700 hover:bg-amber-800 text-white px-4 rounded-lg text-sm font-medium transition-colors">追加</button>
+        </div></div>
+      <div class="space-y-2">
+        ${state.locations.map(l => {
+          const count = state.books.filter(b => b.locationId === l.id).length;
+          return `<div class="bg-white rounded-xl px-4 py-3 flex items-center gap-3 shadow-sm border border-stone-100">
+            <span class="text-amber-700">📍</span>
+            <div class="flex-1"><span class="text-sm font-medium text-stone-800">${esc(l.name)}</span><span class="text-xs text-stone-400 ml-2">${count}冊</span></div>
+            <button onclick="deleteLocation('${l.id}','${esc(l.name)}',${count})" class="text-stone-400 hover:text-red-500"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button></div>`;
+        }).join("")}
+      </div></div>`;
+}
+
+async function addLocation() {
+  const input = document.getElementById("new-loc");
+  const name = input.value.trim();
+  if (!name) return;
+  const id = "loc_" + Date.now();
+  await IDB.put("locations", { id, name, sortOrder: state.locations.length + 1 });
+  input.value = "";
+  await refreshLocations();
+}
+
+async function deleteLocation(id, name, count) {
+  if (count > 0 && !confirm(`「${name}」には${count}冊の本があります。削除しますか？`)) return;
+  await IDB.del("locations", id); await refreshLocations();
+}
+
+function renderDuplicates() {
+  const dupeMap = {};
+  state.books.forEach(b => { if (b.isbn) { if (!dupeMap[b.isbn]) dupeMap[b.isbn] = []; dupeMap[b.isbn].push(b); } });
+  const dupes = Object.entries(dupeMap).filter(([, a]) => a.length > 1);
+  return `
+    <header class="sticky top-0 z-40 bg-white/90 backdrop-blur border-b border-stone-200 px-4 py-3 flex items-center gap-3">
+      <button onclick="navigate('home')" class="text-stone-500 -ml-1"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg></button>
+      <h1 class="text-base font-bold text-stone-800">重複チェック（${dupes.length}件）</h1></header>
+    <div class="px-4 py-4 space-y-4 fade-in">
+      ${dupes.length === 0 ? '<div class="text-center py-16"><p class="text-sm text-stone-400">重複している本はありません</p></div>' :
+      dupes.map(([isbn, arr]) => `<div class="bg-white rounded-2xl p-4 shadow-sm border border-orange-100">
+        <div class="flex items-center gap-2 mb-2"><span class="text-xs font-mono text-stone-400">ISBN: ${isbn}</span><span class="text-xs text-orange-600 bg-orange-50 px-1.5 py-0.5 rounded ml-auto">${arr.length}冊</span></div>
+        <div class="space-y-2">${arr.map(b => `<button onclick="navigate('detail', state.books.find(x=>x.id==='${b.id}'))" class="w-full flex items-center gap-2 text-left px-2 py-1.5 rounded-lg hover:bg-stone-50">
+          ${coverHTML(b.coverUrl, b.title, "sm")}
+          <div class="flex-1 min-w-0"><div class="text-sm text-stone-800 truncate">${esc(b.title)}</div><div class="text-[11px] text-stone-400">${locName(b.locationId) ? "📍" + locName(b.locationId) : "場所未設定"}</div></div></button>`).join("")}
+        </div></div>`).join("")}
+    </div>`;
+}
+
+function renderSettings() {
+  return `
+    <header class="sticky top-0 z-40 bg-white/90 backdrop-blur border-b border-stone-200 px-4 py-3 flex items-center gap-3">
+      <button onclick="navigate('home')" class="text-stone-500 -ml-1"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg></button>
+      <h1 class="text-base font-bold text-stone-800">設定・バックアップ</h1></header>
+    <div class="px-4 py-4 space-y-4 fade-in">
+      <div class="bg-white rounded-2xl p-4 shadow-sm border border-stone-100 space-y-3">
+        <h3 class="text-sm font-bold text-stone-800">データエクスポート</h3>
+        <p class="text-xs text-stone-400">蔵書データをJSONファイルとしてダウンロード。Phase2移行時にも使用できます。</p>
+        <button onclick="exportData()" class="w-full bg-amber-700 hover:bg-amber-800 text-white rounded-xl py-3 text-sm font-medium transition-colors">JSONエクスポート（${state.books.length}冊）</button>
+      </div>
+      <div class="bg-white rounded-2xl p-4 shadow-sm border border-stone-100 space-y-3">
+        <h3 class="text-sm font-bold text-stone-800">データインポート</h3>
+        <label class="w-full border-2 border-dashed border-stone-200 rounded-xl py-3 text-sm text-stone-500 flex items-center justify-center gap-2 cursor-pointer hover:border-amber-300 transition-colors">
+          JSONファイルを選択<input type="file" accept=".json" onchange="importData(event)" class="hidden"></label>
+      </div>
+      <div id="import-status" class="hidden bg-blue-50 rounded-xl px-4 py-3 text-xs text-blue-700"></div>
+      <div class="bg-white rounded-2xl p-4 shadow-sm border border-red-100 space-y-3">
+        <h3 class="text-sm font-bold text-red-600">データ全削除</h3>
+        <button onclick="clearAllData()" class="w-full border border-red-200 text-red-500 hover:bg-red-50 rounded-xl py-3 text-sm font-medium transition-colors">全データを削除</button>
+      </div>
+    </div>`;
+}
+
+function exportData() {
+  const data = { books: state.books, locations: state.locations, categories: state.categories, exportedAt: new Date().toISOString(), version: "1.0" };
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
+  a.download = "bookshelf_backup_" + new Date().toISOString().slice(0, 10) + ".json"; a.click();
+}
+
+async function importData(e) {
+  const file = e.target.files?.[0]; if (!file) return;
+  const reader = new FileReader();
+  reader.onload = async (ev) => {
+    try {
+      const data = JSON.parse(ev.target.result);
+      if (!data.books) throw new Error("Invalid format");
+      if (!confirm(`${data.books.length}冊のデータをインポートしますか？`)) return;
+      for (const b of data.books) await IDB.put("books", b);
+      if (data.locations) for (const l of data.locations) await IDB.put("locations", l);
+      if (data.categories) for (const c of data.categories) await IDB.put("categories", c);
+      await loadData();
+      const el = document.getElementById("import-status");
+      if (el) { el.textContent = data.books.length + "冊のデータをインポートしました"; el.classList.remove("hidden"); }
+    } catch(err) { alert("インポート失敗: " + err.message); }
+  };
+  reader.readAsText(file);
+}
+
+async function clearAllData() {
+  if (!confirm("全てのデータを削除しますか？")) return;
+  if (!confirm("本当に全データを削除してよろしいですか？")) return;
+  await IDB.clear("books"); await refreshBooks(); render();
+}
+
+// ─── Bottom nav ───
+function renderNav() {
+  const tabs = [
+    { id: "home", label: "ホーム", icon: '<path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/>' },
+    { id: "scan", label: "スキャン", icon: '<path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/>' },
+    { id: "books", label: "蔵書一覧", icon: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>' },
+    { id: "locations", label: "場所管理", icon: '<path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/>' },
+  ];
+  return `<nav class="fixed bottom-0 left-0 right-0 bg-white border-t border-stone-200 flex justify-around py-2 px-1 z-50 safe-pb">
+    ${tabs.map(t => `<button onclick="navigate('${t.id}')" class="flex flex-col items-center gap-0.5 px-3 py-1 rounded-lg ${state.page === t.id ? 'text-amber-700' : 'text-stone-400'}">
+      <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">${t.icon}</svg>
+      <span class="text-[10px] font-medium">${t.label}</span></button>`).join("")}
+  </nav>`;
+}
+
+// ─── Main render ───
+function render() {
+  const renderers = { home: renderHome, scan: renderScan, confirm: renderConfirm, books: renderBooks,
+    detail: renderDetail, edit: renderEdit, locations: renderLocations, duplicates: renderDuplicates, settings: renderSettings };
+  const content = (renderers[state.page] || renderHome)();
+  document.getElementById("app").innerHTML = `
+    <div class="flex flex-col min-h-screen bg-stone-50">
+      <div class="flex-1 pb-20">${content}</div>
+      ${renderNav()}
+    </div>`;
+}
+
+// ─── Init ───
+loadData().then(() => render());
+</script>
+</body>
+</html>
