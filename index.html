@@ -15,7 +15,10 @@
   body { margin: 0; background: #fafaf9; overscroll-behavior: none; }
   .safe-pb { padding-bottom: env(safe-area-inset-bottom, 0px); }
   #scanner-region video { border-radius: 12px; }
-  #scanner-region { position: relative; }
+  #scanner-region { position: relative; min-height: 0; transition: min-height 0.3s ease; }
+  /* iOS Safari: video要素の表示を確保 */
+  #scanner-region video { width: 100% !important; height: 100% !important; object-fit: cover !important; }
+  #scanner-region img { display: none !important; } /* QRスキャン枠の画像を非表示 */
   .fade-in { animation: fadeIn 0.2s ease; }
   @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 </style>
@@ -180,29 +183,75 @@ function stopScanner() {
     html5QrCode = null;
   }
   state.scannerActive = false;
+  // DOM直接操作でUIを戻す
+  const el = document.getElementById("scanner-region");
+  if (el) { el.style.minHeight = "0"; el.style.background = "transparent"; el.innerHTML = ""; }
+  const btn = document.getElementById("scanner-toggle");
+  if (btn) { btn.textContent = "カメラを起動してスキャン"; btn.classList.remove("bg-stone-100"); }
 }
 
 function startScanner() {
   stopScanner();
   const el = document.getElementById("scanner-region");
   if (!el) return;
-  html5QrCode = new Html5Qrcode("scanner-region");
+  // iOS Safari対策: 明示的にサイズを確保
+  el.style.minHeight = "300px";
+  el.style.width = "100%";
+  el.style.position = "relative";
+  el.style.overflow = "hidden";
+  el.style.borderRadius = "12px";
+  el.style.background = "#1c1917";
+
+  html5QrCode = new Html5Qrcode("scanner-region", { verbose: false });
+
+  const screenW = Math.min(window.innerWidth - 48, 640);
+  const qrboxW = Math.min(250, screenW - 40);
+
   html5QrCode.start(
     { facingMode: "environment" },
-    { fps: 10, qrbox: { width: 250, height: 100 }, aspectRatio: 1.5 },
+    {
+      fps: 10,
+      qrbox: { width: qrboxW, height: Math.floor(qrboxW * 0.4) },
+      aspectRatio: 4 / 3,
+      videoConstraints: {
+        facingMode: "environment",
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+      }
+    },
     (decoded) => {
       const cleaned = decoded.replace(/[-\s]/g, "");
       if (/^\d{10,13}$/.test(cleaned)) {
         stopScanner();
-        document.getElementById("isbn-input").value = cleaned;
+        const inp = document.getElementById("isbn-input");
+        if (inp) inp.value = cleaned;
         handleISBNLookup(cleaned);
       }
     },
     () => {}
-  ).then(() => { state.scannerActive = true; }).catch(err => {
+  ).then(() => {
+    state.scannerActive = true;
+    // iOS Safari: video要素にplaysinline属性を追加
+    const video = el.querySelector("video");
+    if (video) {
+      video.setAttribute("playsinline", "true");
+      video.setAttribute("webkit-playsinline", "true");
+      video.style.width = "100%";
+      video.style.height = "100%";
+      video.style.objectFit = "cover";
+      video.style.borderRadius = "12px";
+    }
+    // ボタンテキストを更新（renderを呼ばずにDOM直接操作）
+    const btn = document.getElementById("scanner-toggle");
+    if (btn) { btn.textContent = "カメラを停止"; btn.classList.add("bg-stone-100"); }
+    const errEl = document.getElementById("scanner-error");
+    if (errEl) errEl.textContent = "";
+  }).catch(err => {
     console.error("Scanner error:", err);
-    const el = document.getElementById("scanner-error");
-    if (el) el.textContent = "カメラを起動できません。ブラウザの設定でカメラを許可してください。";
+    el.style.minHeight = "0";
+    el.style.background = "transparent";
+    const errEl = document.getElementById("scanner-error");
+    if (errEl) errEl.textContent = "カメラを起動できませんでした。ブラウザ設定でカメラを許可しているか確認してください。エラー: " + (err?.message || err);
   });
 }
 
@@ -223,12 +272,25 @@ function showLoading(on) { const el = document.getElementById("scan-loading"); i
 
 // ─── Render helpers ───
 function esc(s) { if (!s) return ""; const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+function coverFallback(el, title, size) {
+  const sizes = { sm: "w-10 h-14", md: "w-16 h-22", lg: "w-28 h-40" };
+  const tsizes = { sm: "text-[8px]", md: "text-[10px]", lg: "text-xs" };
+  const div = document.createElement("div");
+  div.className = (sizes[size] || sizes.md) + " bg-stone-200 rounded shadow-sm flex items-center justify-center p-1";
+  const span = document.createElement("span");
+  span.className = (tsizes[size] || tsizes.md) + " text-stone-400 text-center leading-tight";
+  span.textContent = (title || "No Image").slice(0, 12);
+  div.appendChild(span);
+  el.replaceWith(div);
+}
 function coverHTML(url, title, size = "md") {
   const sizes = { sm: "w-10 h-14", md: "w-16 h-22", lg: "w-28 h-40" };
   const tsizes = { sm: "text-[8px]", md: "text-[10px]", lg: "text-xs" };
-  const placeholder = `<div class="${sizes[size]} bg-stone-200 rounded shadow-sm flex items-center justify-center p-1"><span class="${tsizes[size]} text-stone-400 text-center leading-tight">${esc((title || "No Image").slice(0, 12))}</span></div>`;
-  if (!url) return placeholder;
-  return `<img src="${esc(url)}" alt="${esc(title)}" class="${sizes[size]} object-cover rounded shadow-sm bg-stone-100" onerror="this.outerHTML='${placeholder.replace(/'/g, "\\'")}'">`;
+  if (!url) {
+    return `<div class="${sizes[size]} bg-stone-200 rounded shadow-sm flex items-center justify-center p-1"><span class="${tsizes[size]} text-stone-400 text-center leading-tight">${esc((title || "No Image").slice(0, 12))}</span></div>`;
+  }
+  const safeTitle = (title || "").replace(/'/g, "&#39;").replace(/"/g, "&#34;");
+  return `<img src="${esc(url)}" alt="${esc(title)}" class="${sizes[size]} object-cover rounded shadow-sm bg-stone-100" onerror="coverFallback(this,'${safeTitle}','${size}')">`;
 }
 function locName(id) { const l = state.locations.find(l => l.id === id); return l ? l.name : ""; }
 function catName(id) { const c = state.categories.find(c => c.id === id); return c ? c.name : ""; }
@@ -281,9 +343,9 @@ function renderScan() {
         <p class="text-xs text-stone-500 mb-3">カメラでバーコードをスキャンするか、ISBNを手入力してください</p>
         <div id="scanner-region" class="mb-3 rounded-xl overflow-hidden"></div>
         <div id="scanner-error" class="text-xs text-red-600 mb-2"></div>
-        <button onclick="state.scannerActive ? stopScanner() : startScanner(); render();"
+        <button onclick="state.scannerActive ? stopScanner() : startScanner();"
           class="w-full border border-amber-200 text-amber-700 rounded-lg py-2 text-sm font-medium mb-3 hover:bg-amber-50 transition-colors"
-          id="scanner-toggle">${state.scannerActive ? "カメラを停止" : "カメラを起動してスキャン"}</button>
+          id="scanner-toggle">カメラを起動してスキャン</button>
         <div class="flex gap-2">
           <input id="isbn-input" type="text" inputmode="numeric" placeholder="978-4-XXXX-XXXX-X"
             class="flex-1 border border-stone-200 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500/30"
