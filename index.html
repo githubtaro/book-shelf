@@ -92,7 +92,7 @@ async function lookupISBN(isbn) {
     if (data.totalItems > 0) {
       const v = data.items[0].volumeInfo;
       result = {
-        isbn: cleaned, title: v.title || "", author: (v.authors || []).join(", "),
+        isbn: cleaned, title: (v.title || "") + (v.subtitle ? " " + v.subtitle : ""), author: (v.authors || []).join(", "),
         publisher: v.publisher || "", publishedDate: v.publishedDate || "",
         description: v.description || "", coverUrl: (v.imageLinks?.thumbnail || "").replace("http:", "https:"),
         pageCount: v.pageCount || null, category: (v.categories || [])[0] || "",
