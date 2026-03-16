@@ -85,53 +85,98 @@ const IDB = {
 // ─── API lookup ───
 async function lookupISBN(isbn) {
   const cleaned = isbn.replace(/[-\s]/g, "");
-  let result = null;
+  let google = null;
+  let openbd = null;
+
+  // ── Google Books API ──
   try {
     const res = await fetch("https://www.googleapis.com/books/v1/volumes?q=isbn:" + cleaned);
     const data = await res.json();
     if (data.totalItems > 0) {
       const v = data.items[0].volumeInfo;
-      result = {
-        isbn: cleaned, title: (v.title || "") + (v.subtitle ? " " + v.subtitle : ""), author: (v.authors || []).join(", "),
-        publisher: v.publisher || "", publishedDate: v.publishedDate || "",
-        description: v.description || "", coverUrl: (v.imageLinks?.thumbnail || "").replace("http:", "https:"),
-        pageCount: v.pageCount || null, category: (v.categories || [])[0] || "",
-        listPrice: null, source: "google"
+      google = {
+        title: v.title || "",
+        subtitle: v.subtitle || "",
+        author: (v.authors || []).join(", "),
+        publisher: v.publisher || "",
+        publishedDate: v.publishedDate || "",
+        description: v.description || "",
+        coverUrl: (v.imageLinks?.thumbnail || "").replace("http:", "https:"),
+        pageCount: v.pageCount || null,
+        category: (v.categories || [])[0] || "",
       };
     }
   } catch(e) { console.error("Google Books error:", e); }
-  if (!result || !result.title) {
-    try {
-      const res = await fetch("https://api.openbd.jp/v1/get?isbn=" + cleaned);
-      const data = await res.json();
-      if (data && data[0]) {
-        const s = data[0].summary;
-        let price = null;
-        try {
-          const onix = data[0].onix;
-          const supplies = onix?.ProductSupply;
-          if (supplies) {
-            const arr = Array.isArray(supplies) ? supplies : [supplies];
-            for (const sup of arr) {
-              const p = sup?.SupplyDetail?.Price;
-              if (p) { const pa = Array.isArray(p) ? p : [p]; for (const pi of pa) { if (pi?.PriceAmount) { price = parseInt(pi.PriceAmount); break; } } }
-              if (price) break;
-            }
+
+  // ── openBD API（常に呼ぶ）──
+  try {
+    const res = await fetch("https://api.openbd.jp/v1/get?isbn=" + cleaned);
+    const data = await res.json();
+    if (data && data[0]) {
+      const s = data[0].summary;
+      let price = null;
+      try {
+        const onix = data[0].onix;
+        const supplies = onix?.ProductSupply;
+        if (supplies) {
+          const arr = Array.isArray(supplies) ? supplies : [supplies];
+          for (const sup of arr) {
+            const p = sup?.SupplyDetail?.Price;
+            if (p) { const pa = Array.isArray(p) ? p : [p]; for (const pi of pa) { if (pi?.PriceAmount) { price = parseInt(pi.PriceAmount); break; } } }
+            if (price) break;
           }
-        } catch(e) {}
-        result = {
-          isbn: cleaned, title: s?.title || result?.title || "",
-          author: s?.author || result?.author || "", publisher: s?.publisher?.name || s?.publisher || result?.publisher || "",
-          publishedDate: s?.pubdate || result?.publishedDate || "",
-          description: data[0].onix?.CollateralDetail?.TextContent?.[0]?.Text || result?.description || "",
-          coverUrl: s?.cover || result?.coverUrl || "", pageCount: result?.pageCount || null,
-          category: result?.category || "", listPrice: price || result?.listPrice || null,
-          source: result?.source === "google" ? "google+openbd" : "openbd"
-        };
-      }
-    } catch(e) { console.error("openBD error:", e); }
+        }
+      } catch(e) {}
+      openbd = {
+        title: s?.title || "",
+        volume: s?.volume || "",
+        series: s?.series || "",
+        author: s?.author || "",
+        publisher: s?.publisher?.name || s?.publisher || "",
+        publishedDate: s?.pubdate || "",
+        description: data[0].onix?.CollateralDetail?.TextContent?.[0]?.Text || "",
+        coverUrl: s?.cover || "",
+        listPrice: price,
+      };
+    }
+  } catch(e) { console.error("openBD error:", e); }
+
+  // ── 両方取れなかった場合 ──
+  if (!google && !openbd) return null;
+
+  // ── データ統合（Google優先、openBDで補完）──
+  const g = google || {};
+  const o = openbd || {};
+
+  // タイトル構築: ベースタイトル + 巻数
+  let baseTitle = g.title || o.title || "";
+  let volume = o.volume || g.subtitle || "";
+  // openBDのvolumeが空でもGoogleのsubtitleがあれば使う
+  // 逆にopenBDのvolumeがあればそちらを優先（日本書籍に特化しているため）
+  let fullTitle = baseTitle;
+  if (volume && !baseTitle.includes(volume)) {
+    fullTitle = baseTitle + " " + volume;
   }
-  return result;
+
+  let source = "manual";
+  if (google && openbd) source = "google+openbd";
+  else if (google) source = "google";
+  else if (openbd) source = "openbd";
+
+  return {
+    isbn: cleaned,
+    title: fullTitle,
+    series: o.series || "",
+    author: g.author || o.author || "",
+    publisher: g.publisher || o.publisher || "",
+    publishedDate: g.publishedDate || o.publishedDate || "",
+    description: g.description || o.description || "",
+    coverUrl: g.coverUrl || o.coverUrl || "",
+    pageCount: g.pageCount || null,
+    category: g.category || "",
+    listPrice: o.listPrice || null,
+    source: source,
+  };
 }
 
 // ─── Default data ───
